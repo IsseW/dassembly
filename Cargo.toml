@@ -7,3 +7,6 @@ edition = "2018"
 
 [dependencies]
 phf = { version = "0.9", features = ["macros"] }
+paste = "1.0.5"
+num-traits = "0.2"
+num-derive = "0.3"

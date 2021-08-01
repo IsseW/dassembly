@@ -1,6 +1,9 @@
+use num_traits::FromPrimitive;
 use phf::{phf_map};
 use std::sync::{Mutex, Arc};
-
+use paste::paste;
+#[macro_use]
+use num_derive::{FromPrimitive, ToPrimitive};
 struct MemoryAllocation<'a> {
     references : usize,
     data : &'a [u8],
@@ -10,6 +13,30 @@ struct Assembly<'a> {
     memory: Vec<Mutex<MemoryAllocation<'a>>>,
     main_thread : Thread<'a>,
 }
+impl<'a> Assembly<'a> {
+
+    fn type_of(&self, memptr : usize) -> Option<OperandType> {
+        Assembly::type_of_memory(self.memory[memptr].lock().ok()?.data)
+    }
+    fn type_of_memory(memory : &[u8]) -> Option<OperandType> {
+        let mut mem: [u8; 4] = Default::default();
+        mem.copy_from_slice(memory);
+        FromPrimitive::from_u32(u32::from_le_bytes(mem))
+    }
+    fn read_field(memory : &[u8], fieldPtr : usize) -> [u8; 8] {
+        let mut mem: [u8; 8] = Default::default();
+        let index = (4 + fieldPtr * 8);
+        mem.copy_from_slice(&memory[index..index + 8]);
+        mem
+    }
+    fn load_field_from_memory(memory : &[u8], fieldPtr : usize) -> Option<Operand> {
+        Some(parse_operand(Assembly::type_of_memory(memory)?, Assembly::read_field(memory, fieldPtr)))
+    }
+
+    fn load_field(&self, ptr : usize, fieldPtr : usize) -> Option<Operand> {
+        Assembly::load_field_from_memory(self.memory[fieldPtr].lock().ok()?.data, fieldPtr)
+    }
+} 
 
 struct Thread<'a> {
     assembly: &'a mut Assembly<'a>,
@@ -28,10 +55,20 @@ impl<'a> Thread<'a> {
         }
     }
 
-    fn run() {
+    fn run(&mut self) {
 
     }
+
+    fn pop_evaluation(&mut self) -> Option<Operand> {
+        self.evaluation.pop()
+    }
+
+    fn push_evaluation(&mut self, operand : Operand) {
+        self.evaluation.push(operand);
+    }
 }
+
+
 
 macro_rules! Operands {
     ($($name:ident : $type:ty), *) => {
@@ -40,7 +77,7 @@ macro_rules! Operands {
             $($name($type)), *,
             None(bool)
         }
-        #[derive(Copy, Clone)]
+        #[derive(Copy, Clone, FromPrimitive, ToPrimitive)]
         pub enum OperandType {
             $($name), *,
             None
@@ -52,6 +89,29 @@ macro_rules! Operands {
                 _ => Operand::None(false),
             }
         }
+
+        pub fn get_operand_type(operand: &Operand) -> OperandType {
+            match operand {
+                $(Operand::$name(_) => OperandType::$name), *,
+                _ => OperandType::None,
+            }
+        }
+
+        
+        impl<'a> Thread<'a> {
+            paste!{$(
+                fn [< pop_ $name:lower >] (&mut self) -> Option<$type> { 
+                    match self.pop_evaluation() { 
+                        Some(Operand::$name(t)) => Some(t), 
+                        _ => None 
+                    }
+                }
+                fn [< push_ $name:lower >] (&mut self, data : $type) {
+                    self.push_evaluation(Operand::$name(data))
+                }
+        
+            )*}
+        }
     };
 }
 
@@ -62,10 +122,11 @@ Operands! {
     MemoryPointer : usize
 }
 
-enum OpcodeResult {
-    Ok,
+enum ErrType {
     WrongOperand,
-    Error(&'static str),
+    Error,
+    EmptyEvaluationStack,
+    MemoryReadError,
 }
 
 macro_rules! count_idents {
@@ -98,11 +159,12 @@ macro_rules! opcodes {
             $($opcode), *
         }
         const NUM_OPCODES: usize = count_idents!($($opcode), *);
+
         define_const_map!(NAME_TO_OPCODE, &'static str, Opcode, $($name => Opcode::$opcode), *);
 
         const OPCODE_TO_NAME: [&'static str; NUM_OPCODES] = [$(stringify!($opcode)), *];
         const OPCODE_DESCRIPTIONS: [&'static str; NUM_OPCODES] = [$($description), *];
-        const OPCODE_FUNCTIONS: [fn(&mut Thread, Operand) -> OpcodeResult; NUM_OPCODES] = [$(|thread, operand| { map_type!(thread, operand, $($operand_type $code), *) }), *];
+        const OPCODE_FUNCTIONS: [fn(&mut Thread, Operand) -> Result<(), ErrType>; NUM_OPCODES] = [$(|thread, operand| { map_type!(thread, operand, $($operand_type $code), *) }), *];
         const OPCODE_EXPECTED_TYPE: [&'static [OperandType]; NUM_OPCODES] = [$(&[$(OperandType::$operand_type), *]), *];
     };
 }
@@ -114,7 +176,7 @@ macro_rules! map_type {
                 let x = $code;
                 return x($thread, data);
             }), *
-            _ => OpcodeResult::WrongOperand,
+            _ => Err(ErrType::WrongOperand),
         }
     };
 }
@@ -122,20 +184,18 @@ macro_rules! map_type {
 // Opcodes can support no and/or one operand
 opcodes! {
     ldfld "ldfld" "Loads a field from the value on the top of the evaluation stack and pushes it onto the evaluation stack."
-    Pointer |thread, data| {
-        if data == 0 {
-            OpcodeResult::Ok 
-        } else { 
-            OpcodeResult::Error("Some error")
-        }
+    Pointer |thread : &mut Thread, data| {
+        
+        let ptr = thread.pop_memorypointer().ok_or(ErrType::EmptyEvaluationStack)?;
+        let operand = thread.assembly.load_field(ptr, data).ok_or(ErrType::MemoryReadError)?;
+
+        thread.push_evaluation(operand);
+
+        Ok(())
     },
     ldlcl "ldlcl" "Loads a local variable and pushes it onto the evaluation stack."
     Pointer |thread, data| {
-        if data == 0 { 
-            OpcodeResult::Ok 
-        } else { 
-            OpcodeResult::Error("Some error")
-        }
+        Ok(())
     }
 }
 
