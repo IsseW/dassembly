@@ -1,7 +1,13 @@
+#![allow(dead_code)]
 use num_traits::FromPrimitive;
 use phf::{phf_map};
-use std::sync::{Mutex, Arc};
+use futures::{FutureExt, lock::Mutex};
+use futures::Future;
 use paste::paste;
+use tokio::time::{self, Sleep};
+use std::pin::Pin;
+use std::task::Poll;
+
 #[macro_use]
 use num_derive::{FromPrimitive, ToPrimitive};
 struct MemoryAllocation<'a> {
@@ -10,13 +16,14 @@ struct MemoryAllocation<'a> {
 }
 
 struct Assembly<'a> {
-    memory: Vec<Mutex<MemoryAllocation<'a>>>,
+    memory: Vec<MemoryAllocation<'a>>,
+    statics: Vec<MemoryAllocation<'a>>,
     main_thread : Thread<'a>,
 }
 impl<'a> Assembly<'a> {
 
     fn type_of(&self, memptr : usize) -> Option<OperandType> {
-        Assembly::type_of_memory(self.memory[memptr].lock().ok()?.data)
+        Assembly::type_of_memory(self.memory[memptr].data)
     }
     fn type_of_memory(memory : &[u8]) -> Option<OperandType> {
         let mut mem: [u8; 4] = Default::default();
@@ -25,7 +32,7 @@ impl<'a> Assembly<'a> {
     }
     fn read_field(memory : &[u8], fieldPtr : usize) -> [u8; 8] {
         let mut mem: [u8; 8] = Default::default();
-        let index = (4 + fieldPtr * 8);
+        let index = 4 + fieldPtr * 8;
         mem.copy_from_slice(&memory[index..index + 8]);
         mem
     }
@@ -34,7 +41,7 @@ impl<'a> Assembly<'a> {
     }
 
     fn load_field(&self, ptr : usize, fieldPtr : usize) -> Option<Operand> {
-        Assembly::load_field_from_memory(self.memory[fieldPtr].lock().ok()?.data, fieldPtr)
+        Assembly::load_field_from_memory(self.memory[fieldPtr].data, fieldPtr)
     }
 } 
 
@@ -66,8 +73,24 @@ impl<'a> Thread<'a> {
     fn push_evaluation(&mut self, operand : Operand) {
         self.evaluation.push(operand);
     }
-}
 
+    fn get_local(&self, ptr : usize) -> Option<Operand> {
+        self.locals.get(ptr).cloned()
+    }
+
+    fn set_local(&mut self, ptr : usize, value : Operand) -> Result<(), ErrType> {
+        if ptr > self.locals.len() {
+            Err(ErrType::UnknownLocal)
+        }
+        else {
+            self.locals[ptr] = value;
+            Ok(())
+        }
+    }
+    fn push_local(&mut self, value : Operand) {
+        self.locals.push(value);
+    }
+}
 
 
 macro_rules! Operands {
@@ -100,12 +123,14 @@ macro_rules! Operands {
         
         impl<'a> Thread<'a> {
             paste!{$(
+                #[allow(dead_code)]
                 fn [< pop_ $name:lower >] (&mut self) -> Option<$type> { 
                     match self.pop_evaluation() { 
                         Some(Operand::$name(t)) => Some(t), 
                         _ => None 
                     }
                 }
+                #[allow(dead_code)]
                 fn [< push_ $name:lower >] (&mut self, data : $type) {
                     self.push_evaluation(Operand::$name(data))
                 }
@@ -119,7 +144,8 @@ Operands! {
     Integer : i64,
     Floating : f64,
     Pointer : usize,
-    MemoryPointer : usize
+    MemoryPointer : usize,
+    Error : usize
 }
 
 enum ErrType {
@@ -127,6 +153,7 @@ enum ErrType {
     Error,
     EmptyEvaluationStack,
     MemoryReadError,
+    UnknownLocal,
 }
 
 macro_rules! count_idents {
@@ -192,9 +219,19 @@ opcodes! {
         thread.push_evaluation(operand);
 
         Ok(())
+        
+    }
+    None |thread : &mut Thread, data| {
+        Ok(())
     },
     ldlcl "ldlcl" "Loads a local variable and pushes it onto the evaluation stack."
-    Pointer |thread, data| {
+    Pointer |thread : &mut Thread, data| {
+        thread.push_evaluation(thread.get_local(data).ok_or(ErrType::UnknownLocal)?);
+        Ok(())
+    },
+    ldcnst "ldstc" "Loads a static variable and pushes it onto the evaluation stack."
+    Pointer |thread : &mut Thread, data| {
+        thread.push_evaluation(thread.get_local(data).ok_or(ErrType::UnknownLocal)?);
         Ok(())
     }
 }
